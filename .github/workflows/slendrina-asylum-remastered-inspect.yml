@@ -1,0 +1,246 @@
+name: Slendrina Asylum Remastered - APK Inspect
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect_apk:
+    name: Inspect Unity APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf work output
+          mkdir -p work/release work/apk output
+
+      - name: Download APK from newest GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="$(gh release list --limit 1 --json tagName --jq '.[0].tagName')"
+
+          if [ -z "$TAG" ]; then
+            echo "ERROR: No GitHub Release exists."
+            echo "Upload the Slendrina Asylum Remastered APK to a Release first."
+            exit 1
+          fi
+
+          echo "Using release: $TAG"
+
+          gh release download "$TAG"             --dir work/release             --pattern "*.apk"             || true
+
+          APK="$(
+            find work/release               -type f               -iname '*.apk'               -printf '%s %p\n'               | sort -nr               | head -1               | cut -d' ' -f2-
+          )"
+
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "ERROR: No APK found in newest Release."
+            gh release view "$TAG" --json assets --jq '.assets[].name' || true
+            exit 1
+          fi
+
+          cp "$APK" work/SlendrinaAsylumRemastered.apk
+
+          {
+            echo "RELEASE_TAG=$TAG"
+            echo "SOURCE_APK=$APK"
+            echo "APK_SIZE_BYTES=$(stat -c%s work/SlendrinaAsylumRemastered.apk)"
+            echo "APK_SHA256=$(sha256sum work/SlendrinaAsylumRemastered.apk | awk '{print $1}')"
+          } | tee output/apk-info.txt
+
+          ls -lh work/SlendrinaAsylumRemastered.apk
+
+      - name: Extract APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          unzip -q             work/SlendrinaAsylumRemastered.apk             -d work/apk
+
+          echo "===== APK ROOT =====" | tee output/apk-tree.txt
+          find work/apk -maxdepth 3 -type f             | sort             | head -500             | tee -a output/apk-tree.txt
+
+      - name: Detect Unity version and scripting backend
+        id: inspect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DATA_DIR=""
+
+          GGM="$(
+            find work/apk               -type f               -name globalgamemanagers               -print               | head -1               || true
+          )"
+
+          if [ -n "$GGM" ]; then
+            DATA_DIR="$(dirname "$GGM")"
+          fi
+
+          if [ -z "$DATA_DIR" ] && [ -d "work/apk/assets/bin/Data" ]; then
+            DATA_DIR="work/apk/assets/bin/Data"
+          fi
+
+          if [ -z "$DATA_DIR" ]; then
+            BOOT="$(
+              find work/apk                 -type f                 -name boot.config                 -print                 | head -1                 || true
+            )"
+
+            if [ -n "$BOOT" ]; then
+              DATA_DIR="$(dirname "$BOOT")"
+            fi
+          fi
+
+          VERSION=""
+
+          if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+            while IFS= read -r FILE; do
+              CANDIDATE="$(
+                strings "$FILE" 2>/dev/null                   | grep -Eo '20[0-9]{2}\.[0-9]+\.[0-9]+[abfp][0-9]+'                   | head -1                   || true
+              )"
+
+              if [ -n "$CANDIDATE" ]; then
+                VERSION="$CANDIDATE"
+                echo "Unity version found in: $FILE"
+                break
+              fi
+            done < <(
+              find "$DATA_DIR"                 -maxdepth 2                 -type f                 -size -64M                 -print
+            )
+          fi
+
+          if [ -z "$VERSION" ]; then
+            while IFS= read -r FILE; do
+              CANDIDATE="$(
+                strings "$FILE" 2>/dev/null                   | grep -Eo '20[0-9]{2}\.[0-9]+\.[0-9]+[abfp][0-9]+'                   | head -1                   || true
+              )"
+
+              if [ -n "$CANDIDATE" ]; then
+                VERSION="$CANDIDATE"
+                echo "Unity version found in native library: $FILE"
+                break
+              fi
+            done < <(
+              find work/apk/lib                 -type f                 \( -name 'libunity.so' -o -name 'libmain.so' \)                 -print                 2>/dev/null
+            )
+          fi
+
+          MANAGED="$(
+            find work/apk               -type f               -path '*/Managed/Assembly-CSharp.dll'               -print               | head -1               || true
+          )"
+
+          META="$(
+            find work/apk               -type f               -name global-metadata.dat               -print               | head -1               || true
+          )"
+
+          IL2CPP="$(
+            find work/apk/lib               -type f               -name libil2cpp.so               -print               | head -1               || true
+          )"
+
+          if [ -n "$MANAGED" ]; then
+            BACKEND="MONO"
+          elif [ -n "$META" ] || [ -n "$IL2CPP" ]; then
+            BACKEND="IL2CPP"
+          else
+            BACKEND="UNKNOWN"
+          fi
+
+          if [ -z "$VERSION" ]; then
+            VERSION="UNKNOWN"
+          fi
+
+          {
+            echo "UNITY_VERSION=$VERSION"
+            echo "SCRIPT_BACKEND=$BACKEND"
+            echo "DATA_DIR=${DATA_DIR:-NOT_FOUND}"
+            echo "GLOBALGAMEMANAGERS=${GGM:-NOT_FOUND}"
+            echo "ASSEMBLY_CSHARP=${MANAGED:-NOT_FOUND}"
+            echo "GLOBAL_METADATA=${META:-NOT_FOUND}"
+            echo "LIBIL2CPP=${IL2CPP:-NOT_FOUND}"
+          } | tee output/unity-inspect.txt
+
+          echo "unity_version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "backend=$BACKEND" >> "$GITHUB_OUTPUT"
+
+      - name: Detect ABIs and native libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "===== ABIS ====="
+
+            if [ -d work/apk/lib ]; then
+              find work/apk/lib                 -mindepth 1                 -maxdepth 1                 -type d                 -printf '%f\n'                 | sort
+            else
+              echo "NO_LIB_DIRECTORY"
+            fi
+
+            echo
+            echo "===== NATIVE LIBRARIES ====="
+
+            find work/apk/lib               -type f               -name '*.so'               -printf '%p | %s bytes\n'               2>/dev/null               | sort               || true
+
+          } | tee output/native-info.txt
+
+      - name: Quick portability verdict
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BACKEND="${{ steps.inspect.outputs.backend }}"
+          VERSION="${{ steps.inspect.outputs.unity_version }}"
+
+          ARM64="NO"
+
+          if [ -d work/apk/lib/arm64-v8a ]; then
+            ARM64="YES"
+          fi
+
+          {
+            echo "Slendrina Asylum Remastered - quick iOS port check"
+            echo
+            echo "Unity version: $VERSION"
+            echo "Scripting backend: $BACKEND"
+            echo "Android arm64-v8a: $ARM64"
+            echo
+
+            if [ "$BACKEND" = "MONO" ]; then
+              echo "RESULT: GOOD CANDIDATE"
+              echo "Reason: Assembly-CSharp.dll is present, so scripts are easier to recover."
+              echo "Next step: AssetRipper -> recovered Unity project -> iOS export."
+            elif [ "$BACKEND" = "IL2CPP" ]; then
+              echo "RESULT: HARDER CANDIDATE"
+              echo "Reason: Android build uses IL2CPP, so game code recovery is harder."
+              echo "Next step: test AssetRipper/Cpp2IL recovery before iOS export."
+            else
+              echo "RESULT: NEEDS MORE INSPECTION"
+              echo "Reason: Unity scripting backend was not detected automatically."
+            fi
+
+          } | tee output/verdict.txt
+
+          cat output/verdict.txt
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Slendrina-Asylum-Remastered-APK-Inspect
+          path: output
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 7
